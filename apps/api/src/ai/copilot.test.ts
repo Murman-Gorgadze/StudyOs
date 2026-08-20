@@ -1,0 +1,566 @@
+import { describe, expect, it } from 'vitest';
+import { safeParseJson } from './client.js';
+import { stripThinking } from './nvidia-provider.js';
+import {
+  copilotQuestionSchema,
+  goalDraftSchema,
+  interviewResponseSchema,
+  draftPatchSchema,
+  preferenceExtractionSchema,
+} from './schemas.js';
+import {
+  DraftValidationError,
+  rewardForTask,
+  validateAndNormalizeDraft,
+} from './draft-validator.js';
+import { answeredPairs } from '../services/copilot-session.js';
+import {
+  applyModelExtraction,
+  createContext,
+  literalAnswers,
+  parseContext,
+  putEntry,
+  recordAnswer,
+  toPlainObject,
+} from './context.js';
+import { classifyGoalText, memoryGateCategory } from './category.js';
+import { canonicalPreferenceKey } from '../services/preferences.js';
+
+// These run entirely offline. Nothing here calls a provider, so the suite is
+// deterministic and costs nothing.
+
+const baseDraft = {
+  title: 'Become More Active',
+  description: 'Walking based routine.',
+  category: 'HEALTH' as const,
+  targetType: 'HABIT' as const,
+  rationale: 'You said you enjoy walking and prefer evenings.',
+  tasks: [
+    {
+      title: 'Evening walk',
+      description: '',
+      recurrence: { type: 'TIMES_PER_WEEK' as const, timesPerWeek: 5 },
+      estimatedMinutes: 35,
+      preferredTime: '20:00',
+      reason: 'You enjoy walking.',
+    },
+  ],
+};
+
+describe('tolerant JSON extraction', () => {
+  it('parses a clean object', () => {
+    expect(safeParseJson('{"a":1}')).toEqual({ ok: true, value: { a: 1 } });
+  });
+
+  it('unwraps a markdown fence', () => {
+    const result = safeParseJson('```json\n{"a":1}\n```');
+    expect(result).toEqual({ ok: true, value: { a: 1 } });
+  });
+
+  it('recovers an object buried in prose', () => {
+    const result = safeParseJson('Sure! Here you go:\n{"a":1}\nHope that helps.');
+    expect(result).toEqual({ ok: true, value: { a: 1 } });
+  });
+
+  it('reports failure rather than guessing', () => {
+    expect(safeParseJson('not json at all')).toEqual({ ok: false });
+  });
+});
+
+describe('reasoning leakage', () => {
+  it('strips a think block that leaked into the content', () => {
+    expect(stripThinking('<think>hmm let me see</think>{"a":1}')).toBe('{"a":1}');
+    expect(stripThinking('plain output')).toBe('plain output');
+  });
+});
+
+describe('question schema', () => {
+  it('accepts a select question with options', () => {
+    const parsed = copilotQuestionSchema.parse({
+      id: 'preferred_activity',
+      type: 'MULTI_SELECT',
+      prompt: 'Which activities do you enjoy?',
+      options: ['Walking', 'Swimming'],
+    });
+    expect(parsed.options).toEqual(['Walking', 'Swimming']);
+    expect(parsed.optional).toBe(true);
+  });
+
+  it('tolerates null/empty options on a question that has none', () => {
+    // Models send null instead of omitting the field; a NUMBER question has no list.
+    const parsed = copilotQuestionSchema.parse({
+      id: 'days_per_week',
+      type: 'NUMBER',
+      prompt: 'How many days per week?',
+      options: null,
+    });
+    expect(parsed.options).toBeUndefined();
+    expect(copilotQuestionSchema.parse({ ...parsed, options: [] }).options).toBeUndefined();
+  });
+
+  it('coerces numeric options rather than failing the turn', () => {
+    // "How many days per week?" legitimately comes back as [3, 4, 5, 6].
+    const parsed = copilotQuestionSchema.parse({
+      id: 'days_per_week',
+      type: 'SINGLE_SELECT',
+      prompt: 'How many days per week?',
+      options: [3, 4, 5, 6],
+    });
+    expect(parsed.options).toEqual(['3', '4', '5', '6']);
+  });
+
+  it('rejects a made-up question type', () => {
+    expect(() =>
+      copilotQuestionSchema.parse({ id: 'x', type: 'RENDER_IFRAME', prompt: 'hi' }),
+    ).toThrow();
+  });
+
+  it('rejects a snake_case violation and an oversized option list', () => {
+    expect(() =>
+      copilotQuestionSchema.parse({ id: 'Bad Id', type: 'FREE_TEXT', prompt: 'hi' }),
+    ).toThrow();
+    expect(() =>
+      copilotQuestionSchema.parse({
+        id: 'x',
+        type: 'SINGLE_SELECT',
+        prompt: 'hi',
+        options: Array.from({ length: 12 }, (_, i) => `opt${i}`),
+      }),
+    ).toThrow();
+  });
+
+  it('requires a select question to actually offer choices', () => {
+    const result = interviewResponseSchema.safeParse({
+      state: 'NEEDS_MORE_INFORMATION',
+      assistantMessage: 'Pick one',
+      question: { id: 'x', type: 'SINGLE_SELECT', prompt: 'Pick one', options: ['only'] },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('requires a question when more information is needed', () => {
+    const result = interviewResponseSchema.safeParse({
+      state: 'NEEDS_MORE_INFORMATION',
+      assistantMessage: 'Thinking...',
+      question: null,
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('context provenance', () => {
+  const memory = [
+    { key: 'preferred_activity', value: 'walking' },
+    { key: 'disliked_activity', value: 'running' },
+  ];
+
+  it('ranks a literal answer above anything the model infers', () => {
+    const ctx = createContext('get fitter');
+    recordAnswer(ctx, { key: 'liked_activities', questionId: 'q1', value: 'dancing' });
+    applyModelExtraction(ctx, { liked_activities: 'walking' }, memory);
+    expect(toPlainObject(ctx).liked_activities).toBe('dancing');
+  });
+
+  it('lets an explicit correction supersede an earlier answer', () => {
+    const ctx = createContext('get fitter');
+    recordAnswer(ctx, { key: 'liked_activities', questionId: 'q1', value: 'gym' });
+    // "Actually, I meant swimming" arrives through the corrections channel.
+    applyModelExtraction(ctx, {}, memory, { liked_activities: 'swimming' });
+    expect(toPlainObject(ctx).liked_activities).toBe('swimming');
+  });
+
+  it('does not let a plain extraction masquerade as a correction', () => {
+    const ctx = createContext('get fitter');
+    recordAnswer(ctx, { key: 'liked_activities', questionId: 'q1', value: 'gym' });
+    applyModelExtraction(ctx, { liked_activities: 'swimming' }, memory);
+    expect(toPlainObject(ctx).liked_activities).toBe('gym');
+  });
+
+  it('accepts a genuinely new fact', () => {
+    const ctx = createContext('get fitter');
+    applyModelExtraction(ctx, { minutes_per_session: 30 }, memory);
+    expect(toPlainObject(ctx).minutes_per_session).toBe(30);
+  });
+
+  it('goal intent cannot be rewritten by anything', () => {
+    const ctx = createContext('build a house');
+    applyModelExtraction(ctx, { goalIntent: 'get fit' }, memory, { goalIntent: 'get fit' });
+    expect(ctx.goalIntent).toBe('build a house');
+    expect(putEntry(ctx, 'goalIntent', { value: 'x', source: 'CURRENT_USER_ANSWER' })).toBe(false);
+  });
+
+  it('records where every value came from', () => {
+    const ctx = createContext('get fitter');
+    recordAnswer(ctx, { key: 'liked_activities', questionId: 'q1', value: 'dancing' });
+    applyModelExtraction(ctx, { plan_style: 'flexible' }, memory);
+    expect(ctx.entries.liked_activities.source).toBe('CURRENT_USER_ANSWER');
+    expect(ctx.entries.plan_style.source).toBe('CURRENT_SESSION_INFERENCE');
+    expect(literalAnswers(ctx).map((a) => a.key)).toEqual(['liked_activities']);
+  });
+
+  it('migrates a pre-provenance blob at the weakest plausible authority', () => {
+    const ctx = parseContext(JSON.stringify({ days_per_week: 5 }), 'read more');
+    expect(ctx.entries.days_per_week.source).toBe('CURRENT_SESSION_INFERENCE');
+    expect(ctx.goalIntent).toBe('read more');
+  });
+});
+
+describe('preference contamination guard', () => {
+  // Regression: memories from PREVIOUS goals were echoed back as extracted
+  // context and became "facts the user stated" — producing a walking plan for
+  // someone who answered "dancing".
+  const memory = [
+    { key: 'preferred_activity', value: 'walking' },
+    { key: 'disliked_activity', value: 'running' },
+  ];
+
+  it('drops a memory the model merely parroted back', () => {
+    const ctx = createContext('build a house');
+    applyModelExtraction(ctx, { preferred_activity: 'walking' }, memory);
+    expect(toPlainObject(ctx)).toEqual({});
+  });
+
+  it('drops a mutated memory key the user never spoke to', () => {
+    const ctx = createContext('build a house');
+    applyModelExtraction(ctx, { preferred_activity: 'swimming' }, memory);
+    expect(toPlainObject(ctx).preferred_activity).toBeUndefined();
+  });
+
+  it('allows that same key once the user has actually answered it', () => {
+    const ctx = createContext('get fitter');
+    recordAnswer(ctx, { key: 'preferred_activity', questionId: 'q1', value: 'dancing' });
+    applyModelExtraction(ctx, {}, memory, { preferred_activity: 'salsa' });
+    expect(toPlainObject(ctx).preferred_activity).toBe('salsa');
+  });
+
+  it('never stores a memory hint at user authority', () => {
+    const ctx = createContext('save money');
+    applyModelExtraction(ctx, { preferred_activity: 'walking' }, memory);
+    const userAuthored = Object.values(ctx.entries).filter(
+      (e) => e.source === 'CURRENT_USER_ANSWER' || e.source === 'CURRENT_USER_MESSAGE',
+    );
+    expect(userAuthored).toHaveLength(0);
+  });
+});
+
+describe('preference key canonicalisation', () => {
+  // One account accumulated 47 preferences with five different keys for session
+  // length, and a FITNESS block holding both "evenings" and "morning".
+  it('collapses the many names the model invents for session length', () => {
+    for (const key of [
+      'session_duration',
+      'session_duration_minutes',
+      'session_length',
+      'ideal_session_length',
+      'preferred_session_length',
+    ]) {
+      expect(canonicalPreferenceKey(key)).toBe('session_length_minutes');
+    }
+  });
+
+  it('collapses frequency and day-list variants', () => {
+    for (const key of [
+      'frequency',
+      'preferred_frequency',
+      'session_frequency',
+      'preferred_sessions_per_week',
+      'preferred_days_of_week',
+    ]) {
+      expect(canonicalPreferenceKey(key)).toBe('sessions_per_week');
+    }
+  });
+
+  it('collapses time-of-day variants so they cannot contradict each other', () => {
+    for (const key of ['preferred_time', 'preferred_time_of_day', 'energy_time', 'focus_time']) {
+      expect(canonicalPreferenceKey(key)).toBe('preferred_time_of_day');
+    }
+  });
+
+  it('merges numbered activity duplicates', () => {
+    expect(canonicalPreferenceKey('preferred_activity_2')).toBe('preferred_activity');
+    expect(canonicalPreferenceKey('disliked_activity')).toBe('disliked_activity');
+  });
+
+  it('leaves an unrecognised key alone', () => {
+    expect(canonicalPreferenceKey('preferred_book_type')).toBe('preferred_book_type');
+  });
+});
+
+describe('memory gating', () => {
+  it('classifies from the user text, not the model', () => {
+    expect(classifyGoalText('I want to save $3,000 for a trip').category).toBe('FINANCE');
+    expect(classifyGoalText('I want to get fitter and go to the gym').category).toBe('FITNESS');
+  });
+
+  it('withholds category memory when the model disagrees with the text', () => {
+    // The exact shape of the bug: model said FITNESS for a construction project.
+    expect(memoryGateCategory('I need to build a house', 'FITNESS').category).toBeNull();
+  });
+
+  it('withholds category memory when the goal is not clearly categorised', () => {
+    expect(memoryGateCategory('I need to build a house', null).category).toBeNull();
+  });
+
+  it('allows category memory when the text independently agrees', () => {
+    expect(memoryGateCategory('I want to get fitter, gym and cardio', 'FITNESS').category).toBe(
+      'FITNESS',
+    );
+  });
+});
+
+describe('answered pairs', () => {
+  it('pairs each question with the answer it received', () => {
+    const pairs = answeredPairs([
+      {
+        role: 'assistant',
+        content: 'Which activities?',
+        structuredPayload: JSON.stringify({ id: 'liked_activities', prompt: 'Which activities?' }),
+      },
+      {
+        role: 'user',
+        content: 'Walking',
+        structuredPayload: JSON.stringify({ questionId: 'liked_activities', answer: ['Walking'] }),
+      },
+    ]);
+    expect(pairs).toEqual([
+      { questionId: 'liked_activities', prompt: 'Which activities?', answer: 'Walking' },
+    ]);
+  });
+});
+
+describe('recurrence mapping', () => {
+  it('normalises a near-miss frequency', () => {
+    // 8x/week reads as someone counting a twice-daily session: the intent is clear.
+    const result = validateAndNormalizeDraft(
+      {
+        ...baseDraft,
+        tasks: [{ ...baseDraft.tasks[0], recurrence: { type: 'TIMES_PER_WEEK', timesPerWeek: 8 } }],
+      },
+      'UTC',
+    );
+    expect(result.tasks[0].recurrenceConfig.timesPerWeek).toBe(7);
+    expect(result.adjustments.join(' ')).toMatch(/capped/i);
+  });
+
+  it('rejects a semantically impossible frequency rather than clamping it', () => {
+    // 300x/week is not a rounding error. Silently turning it into 7 would hand
+    // the user a plan nobody asked for.
+    expect(() =>
+      validateAndNormalizeDraft(
+        {
+          ...baseDraft,
+          tasks: [
+            { ...baseDraft.tasks[0], recurrence: { type: 'TIMES_PER_WEEK', timesPerWeek: 300 } },
+          ],
+        },
+        'UTC',
+      ),
+    ).toThrow(DraftValidationError);
+  });
+
+  it('falls back when a weekday task names no weekdays', () => {
+    const result = validateAndNormalizeDraft(
+      {
+        ...baseDraft,
+        tasks: [{ ...baseDraft.tasks[0], recurrence: { type: 'SPECIFIC_WEEKDAYS', weekdays: [] } }],
+      },
+      'UTC',
+    );
+    expect(result.tasks[0].recurrenceType).toBe('EVERY_DAY');
+  });
+
+  it('deduplicates and sorts weekdays', () => {
+    const result = validateAndNormalizeDraft(
+      {
+        ...baseDraft,
+        tasks: [
+          { ...baseDraft.tasks[0], recurrence: { type: 'SPECIFIC_WEEKDAYS', weekdays: [5, 1, 1, 3] } },
+        ],
+      },
+      'UTC',
+    );
+    expect(result.tasks[0].recurrenceConfig.weekdays).toEqual([1, 3, 5]);
+  });
+
+  it('refuses a recurrence type the app does not support', () => {
+    const result = goalDraftSchema.safeParse({
+      ...baseDraft,
+      tasks: [{ ...baseDraft.tasks[0], recurrence: { type: 'SOMETIMES_WHEN_MOTIVATED' } }],
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('draft validation', () => {
+  it('drops a deadline that is not in the future', () => {
+    const result = validateAndNormalizeDraft(
+      { ...baseDraft, deadline: '2020-01-01' },
+      'UTC',
+      new Date('2026-08-20T10:00:00Z'),
+    );
+    expect(result.deadline).toBeNull();
+    expect(result.adjustments.join(' ')).toMatch(/not in the future/i);
+  });
+
+  it('downgrades a deadline goal with no usable date to a habit', () => {
+    const result = validateAndNormalizeDraft(
+      { ...baseDraft, targetType: 'DEADLINE', deadline: null },
+      'UTC',
+    );
+    expect(result.targetType).toBe('HABIT');
+  });
+
+  it('removes duplicate tasks', () => {
+    const result = validateAndNormalizeDraft(
+      { ...baseDraft, tasks: [baseDraft.tasks[0], { ...baseDraft.tasks[0] }] },
+      'UTC',
+    );
+    expect(result.tasks).toHaveLength(1);
+  });
+
+  it('rejects a plan nobody could sustain', () => {
+    expect(() =>
+      validateAndNormalizeDraft(
+        {
+          ...baseDraft,
+          tasks: Array.from({ length: 8 }, (_, i) => ({
+            ...baseDraft.tasks[0],
+            title: `Task ${i}`,
+            estimatedMinutes: 240,
+            recurrence: { type: 'EVERY_DAY' as const },
+          })),
+        },
+        'UTC',
+      ),
+    ).toThrow(DraftValidationError);
+  });
+
+  it('trims a long-but-plausible session', () => {
+    const result = validateAndNormalizeDraft(
+      { ...baseDraft, tasks: [{ ...baseDraft.tasks[0], estimatedMinutes: 300 }] },
+      'UTC',
+    );
+    expect(result.tasks[0].estimatedMinutes).toBe(240);
+  });
+
+  it('rejects a session length that is not a real session', () => {
+    expect(() =>
+      validateAndNormalizeDraft(
+        { ...baseDraft, tasks: [{ ...baseDraft.tasks[0], estimatedMinutes: 900 }] },
+        'UTC',
+      ),
+    ).toThrow(DraftValidationError);
+  });
+});
+
+describe('reward calculation', () => {
+  it('derives reward from effort, never from the model', () => {
+    expect(rewardForTask({ estimatedMinutes: 5 })).toBe(5);
+    expect(rewardForTask({ estimatedMinutes: 20 })).toBe(10);
+    expect(rewardForTask({ estimatedMinutes: 35 })).toBe(15);
+    expect(rewardForTask({ estimatedMinutes: 60 })).toBe(20);
+    expect(rewardForTask({ estimatedMinutes: 180 })).toBe(25);
+  });
+
+  it('is bounded, so an AI-created goal cannot inflate the leaderboard', () => {
+    const rewards = [1, 10, 45, 120, 600].map((m) => rewardForTask({ estimatedMinutes: m }));
+    expect(Math.max(...rewards)).toBeLessThanOrEqual(25);
+  });
+
+  it('ignores any reward the model tries to supply', () => {
+    const parsed = goalDraftSchema.parse({
+      ...baseDraft,
+      tasks: [{ ...baseDraft.tasks[0], reward: 9999, rewardSuggestion: 9999 }],
+    });
+    expect(parsed.tasks[0]).not.toHaveProperty('reward');
+  });
+});
+
+describe('lenient parsing of common model quirks', () => {
+  it('pads a single-digit time', () => {
+    const parsed = goalDraftSchema.parse({
+      ...baseDraft,
+      tasks: [{ ...baseDraft.tasks[0], preferredTime: '8:00' }],
+    });
+    expect(parsed.tasks[0].preferredTime).toBe('08:00');
+  });
+
+  it('still rejects something that is not a time at all', () => {
+    const result = goalDraftSchema.safeParse({
+      ...baseDraft,
+      tasks: [{ ...baseDraft.tasks[0], preferredTime: 'in the morning' }],
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('treats an unknown preference scope as session-only', () => {
+    // The model confuses `scope` with `persistence` and answers "SESSION".
+    const parsed = preferenceExtractionSchema.parse({
+      preferences: [
+        {
+          key: 'preferred_activity',
+          value: 'dancing',
+          scope: 'SESSION',
+          confidence: 0.9,
+          persistence: 'LONG_TERM',
+        },
+      ],
+    });
+    expect(parsed.preferences[0].scope).toBe('SESSION_ONLY');
+  });
+
+  it('drops an invented category instead of failing extraction', () => {
+    const parsed = preferenceExtractionSchema.parse({
+      preferences: [
+        {
+          key: 'preferred_language',
+          value: 'spanish',
+          scope: 'CATEGORY',
+          category: 'LANGUAGE',
+          confidence: 0.9,
+          persistence: 'LONG_TERM',
+        },
+      ],
+    });
+    expect(parsed.preferences[0].category).toBeNull();
+  });
+
+  it('coerces a numeric preference value', () => {
+    const parsed = preferenceExtractionSchema.parse({
+      preferences: [
+        {
+          key: 'days_per_week',
+          value: 5,
+          scope: 'GLOBAL',
+          confidence: 0.9,
+          persistence: 'LONG_TERM',
+        },
+      ],
+    });
+    expect(parsed.preferences[0].value).toBe('5');
+  });
+});
+
+describe('draft patches', () => {
+  it('accepts a minimal field update', () => {
+    const parsed = draftPatchSchema.parse({
+      assistantMessage: 'Made the walks 30 minutes.',
+      operations: [{ type: 'UPDATE_TASK', taskId: 'task-1', changes: { estimatedMinutes: 30 } }],
+    });
+    expect(parsed.operations).toHaveLength(1);
+  });
+
+  it('rejects an unknown operation type', () => {
+    const result = draftPatchSchema.safeParse({
+      assistantMessage: 'ok',
+      operations: [{ type: 'DROP_DATABASE', taskId: 'x' }],
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects an empty patch', () => {
+    expect(draftPatchSchema.safeParse({ assistantMessage: 'ok', operations: [] }).success).toBe(
+      false,
+    );
+  });
+});

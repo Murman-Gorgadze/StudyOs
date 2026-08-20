@@ -1,0 +1,501 @@
+// Goalify — Phase 1 domain model.
+//
+// Design notes:
+//  * SQLite does not support native enums or Json columns in Prisma, so status-like
+//    fields are Strings validated at the application boundary (see src/domain/enums.ts)
+//    and structured config is stored as a JSON-encoded String.
+//  * A "challenge" is NOT a separate entity. A Goal with >1 GoalParticipant *is* a
+//    challenge. Private goal = 1 participant. Public challenge = many.
+//  * TaskDefinition (the recurring rule) is separate from TaskOccurrence (one dated
+//    instance, per participant). Occurrences are the single source of truth for
+//    progress, streaks and leaderboards.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------- identity
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  profile             Profile?
+  ownedGoals          Goal[]              @relation("GoalOwner")
+  participations      GoalParticipant[]
+  sentFriendships     Friendship[]        @relation("FriendshipRequester")
+  friendshipsA        Friendship[]        @relation("FriendshipUserA")
+  friendshipsB        Friendship[]        @relation("FriendshipUserB")
+  sentInvitations     GoalInvitation[]    @relation("InvitationInviter")
+  receivedInvitations GoalInvitation[]    @relation("InvitationInvitee")
+  notifications       Notification[]
+  achievements        UserAchievement[]
+  rewards             RewardTransaction[]
+  sessions            Session[]
+  resetTokens         PasswordResetToken[]
+  copilotSessions     CopilotSession[]
+  goalDrafts          GoalDraft[]
+  preferences         UserPreference[]
+}
+
+model Profile {
+  id       String @id @default(cuid())
+  userId   String @unique
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  avatarEmoji String @default("🐱")
+  bio         String @default("")
+  // IANA timezone, e.g. "Asia/Tbilisi". Used as the default for goals they create.
+  timezone    String @default("UTC")
+
+  totalCoins Int @default(0)
+  level      Int @default(1)
+  bestStreak Int @default(0)
+
+  // Notification category toggles (Phase 1Q)
+  notifyTaskReminders     Boolean @default(true)
+  notifyFriendActivity    Boolean @default(true)
+  notifyLeaderboardUpdate Boolean @default(true)
+  notifyAchievements      Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Password resets are deliberately NOT sessions. A reset token must not be usable
+// as a login by itself, must expire quickly, and must work exactly once.
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------- goals
+
+model Goal {
+  id      String @id @default(cuid())
+  ownerId String
+  owner   User   @relation("GoalOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String @default("")
+  category    String // GoalCategory
+
+  visibility String // PRIVATE | PUBLIC
+  status     String @default("ACTIVE") // ACTIVE | PAUSED | COMPLETED | ARCHIVED
+
+  // Shareable join code. Anyone holding it may join, even a stranger and even
+  // when the goal is PRIVATE — that is the point of handing the link out. It is
+  // owner-generated, revocable and rotatable, so access can always be withdrawn.
+  inviteCode        String?   @unique
+  inviteCodeCreated DateTime?
+
+  targetType  String // HABIT | QUANTITY | WEEKLY_TARGET | DEADLINE
+  targetValue Int? // e.g. 10 books, 3x per week
+
+  // Day boundaries for this goal are evaluated in this timezone (Phase 1L).
+  // Defaults to the creator's timezone at creation time.
+  timezone  String
+  startDate String // YYYY-MM-DD, in the goal's timezone
+  deadline  String? // YYYY-MM-DD, in the goal's timezone
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  participants GoalParticipant[]
+  tasks        TaskDefinition[]
+  invitations  GoalInvitation[]
+  rewards      RewardTransaction[]
+
+  @@index([visibility, status])
+  @@index([ownerId])
+}
+
+model GoalParticipant {
+  id     String @id @default(cuid())
+  goalId String
+  goal   Goal   @relation(fields: [goalId], references: [id], onDelete: Cascade)
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  role   String @default("MEMBER") // OWNER | MEMBER
+  status String @default("ACTIVE") // ACTIVE | LEFT
+
+  // Day the participant joined, in the goal's timezone. Days before this are
+  // excluded from their Average leaderboard score.
+  joinedOn String // YYYY-MM-DD
+  leftOn   String? // YYYY-MM-DD, exclusive upper bound once they leave
+
+  currentStreak Int @default(0)
+  bestStreak    Int @default(0)
+
+  createdAt DateTime @default(now())
+
+  occurrences TaskOccurrence[]
+
+  @@unique([goalId, userId])
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------- tasks
+
+model TaskDefinition {
+  id     String @id @default(cuid())
+  goalId String
+  goal   Goal   @relation(fields: [goalId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String @default("")
+
+  // ONCE | EVERY_DAY | SPECIFIC_WEEKDAYS | TIMES_PER_WEEK | EVERY_X_DAYS
+  recurrenceType String
+  // JSON-encoded. Shape depends on recurrenceType:
+  //   SPECIFIC_WEEKDAYS -> { "weekdays": [1,3,5] }   (0=Sun … 6=Sat)
+  //   TIMES_PER_WEEK    -> { "timesPerWeek": 3 }
+  //   EVERY_X_DAYS      -> { "intervalDays": 2 }
+  //   ONCE / EVERY_DAY  -> {}
+  recurrenceConfig String @default("{}")
+
+  reward Int @default(10) // coins granted on completion
+
+  startDate    String // YYYY-MM-DD
+  endDate      String? // YYYY-MM-DD
+  reminderTime String? // HH:MM local to the goal's timezone
+
+  archivedAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  occurrences TaskOccurrence[]
+
+  @@index([goalId])
+}
+
+model TaskOccurrence {
+  id               String          @id @default(cuid())
+  taskDefinitionId String
+  taskDefinition   TaskDefinition  @relation(fields: [taskDefinitionId], references: [id], onDelete: Cascade)
+  participantId    String
+  participant      GoalParticipant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+
+  // The challenge day this occurrence belongs to, in the goal's timezone.
+  dueDate String // YYYY-MM-DD
+  status  String @default("PENDING") // PENDING | COMPLETED | MISSED | SKIPPED
+
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  reward RewardTransaction?
+
+  @@unique([taskDefinitionId, participantId, dueDate])
+  @@index([participantId, dueDate])
+  @@index([dueDate, status])
+}
+
+// ---------------------------------------------------------------- social
+
+// One row per pair, with userAId < userBId enforced by the application so that a
+// duplicate friendship is impossible.
+model Friendship {
+  id     String @id @default(cuid())
+  userAId String
+  userA   User   @relation("FriendshipUserA", fields: [userAId], references: [id], onDelete: Cascade)
+  userBId String
+  userB   User   @relation("FriendshipUserB", fields: [userBId], references: [id], onDelete: Cascade)
+
+  status String // PENDING | ACCEPTED | BLOCKED
+
+  requestedById String
+  requestedBy   User   @relation("FriendshipRequester", fields: [requestedById], references: [id], onDelete: Cascade)
+  // Set when status is BLOCKED, so the block can be undone by its author only.
+  blockedById   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userAId, userBId])
+  @@index([userBId])
+}
+
+model GoalInvitation {
+  id     String @id @default(cuid())
+  goalId String
+  goal   Goal   @relation(fields: [goalId], references: [id], onDelete: Cascade)
+
+  inviterId String
+  inviter   User   @relation("InvitationInviter", fields: [inviterId], references: [id], onDelete: Cascade)
+  inviteeId String
+  invitee   User   @relation("InvitationInvitee", fields: [inviteeId], references: [id], onDelete: Cascade)
+
+  status String @default("PENDING") // PENDING | ACCEPTED | DECLINED | CANCELLED
+
+  createdAt   DateTime  @default(now())
+  respondedAt DateTime?
+
+  @@unique([goalId, inviteeId])
+  @@index([inviteeId, status])
+}
+
+// ---------------------------------------------------------------- engagement
+
+model Notification {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // REMINDER | FRIEND | PROGRESS | LEADERBOARD | ACHIEVEMENT
+  type  String
+  title String
+  body  String @default("")
+  // JSON-encoded payload for deep-linking, e.g. { "goalId": "..." }
+  data  String @default("{}")
+
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, readAt])
+}
+
+model Achievement {
+  id          String @id @default(cuid())
+  code        String @unique // FIRST_TASK, STREAK_7, TASKS_30, ...
+  title       String
+  description String
+  icon        String @default("🏆")
+  reward      Int    @default(0)
+
+  users UserAchievement[]
+}
+
+model UserAchievement {
+  id            String      @id @default(cuid())
+  userId        String
+  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  achievementId String
+  achievement   Achievement @relation(fields: [achievementId], references: [id], onDelete: Cascade)
+
+  unlockedAt DateTime @default(now())
+
+  @@unique([userId, achievementId])
+}
+
+model RewardTransaction {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  amount Int // positive = earned, negative = reverted (undo)
+  reason String // TASK_COMPLETED | TASK_UNDONE | ACHIEVEMENT | GOAL_COMPLETED
+
+  goalId String?
+  goal   Goal?   @relation(fields: [goalId], references: [id], onDelete: SetNull)
+
+  // One reward row per occurrence, so undo can reverse it exactly once.
+  taskOccurrenceId String?         @unique
+  taskOccurrence   TaskOccurrence? @relation(fields: [taskOccurrenceId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+// ============================================================================
+// Phase 2 — Goal Copilot
+//
+// The AI never writes to Goal/TaskDefinition directly. It produces a GoalDraft,
+// the backend validates it, the user confirms, and only then do the existing
+// Phase 1 services create the real entities.
+// ============================================================================
+
+model CopilotSession {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // INTERVIEWING | READY_TO_GENERATE | DRAFT_GENERATED | CONFIRMED | CANCELLED | EXPIRED
+  status String @default("INTERVIEWING")
+
+  initialGoalText String
+  category        String?
+
+  /// The authoritative structured context, JSON-encoded. Goal generation reads
+  /// THIS, not the raw transcript, so a user correction genuinely overwrites an
+  /// earlier answer instead of both versions lingering in the chat history.
+  structuredContext String @default("{}")
+  summary           String @default("")
+
+  /// Question ids already asked, so the model cannot repeat itself.
+  askedQuestionIds String @default("[]")
+  questionCount    Int    @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  expiresAt DateTime
+
+  messages CopilotMessage[]
+  drafts   GoalDraft[]
+
+  @@index([userId, status])
+}
+
+model CopilotMessage {
+  id        String         @id @default(cuid())
+  sessionId String
+  session   CopilotSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  role    String // system | user | assistant
+  content String
+
+  /// JSON-encoded question or extracted context that went with this turn.
+  structuredPayload String?
+
+  createdAt DateTime @default(now())
+
+  @@index([sessionId, createdAt])
+}
+
+model GoalDraft {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  sessionId String?
+  session   CopilotSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  title       String
+  description String @default("")
+  category    String
+  targetType  String
+  targetValue Int?
+  deadline    String? // YYYY-MM-DD
+  visibility  String  @default("PRIVATE")
+
+  /// Why this plan fits this user — shown on the review screen.
+  rationale String @default("")
+
+  // GENERATED | EDITING | CONFIRMED | DISCARDED
+  status String @default("GENERATED")
+
+  /// Set once the user confirms and the real Goal is created.
+  createdGoalId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tasks GoalDraftTask[]
+
+  @@index([userId, status])
+}
+
+model GoalDraftTask {
+  id      String    @id @default(cuid())
+  draftId String
+  draft   GoalDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String @default("")
+
+  recurrenceType   String
+  recurrenceConfig String @default("{}")
+
+  estimatedMinutes Int?
+  preferredTime    String? // HH:MM
+
+  /// The personalised justification, quoted back to the user on review.
+  reason    String @default("")
+  sortOrder Int    @default(0)
+
+  @@index([draftId, sortOrder])
+}
+
+model UserPreference {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// GLOBAL | CATEGORY | GOAL
+  scope String @default("GLOBAL")
+  /// Empty string for GLOBAL scope. NOT nullable: SQLite treats NULLs as distinct
+  /// in a unique index, which would let duplicate global preferences pile up.
+  category String @default("")
+
+  key   String
+  value String
+
+  confidence Float  @default(0.5)
+  source     String @default("COPILOT") // COPILOT | USER
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, scope, category, key])
+  @@index([userId])
+}
+
+/// Provider call telemetry. Never stores prompts, completions or secrets.
+model AiCallLog {
+  id     String  @id @default(cuid())
+  userId String?
+
+  provider      String
+  model         String
+  promptVersion String
+  purpose       String // INTERVIEW | DRAFT_GENERATION | DRAFT_EDIT | PROGRESS_ANALYSIS | PREFERENCE_EXTRACTION
+
+  /// Time inside the provider call itself.
+  latencyMs        Int
+  /// Wall time for the whole logical call, including schema-repair retries.
+  totalMs          Int?
+  promptTokens     Int?
+  completionTokens Int?
+
+  status     String // OK | INVALID_JSON | PROVIDER_ERROR | TIMEOUT
+  errorType  String?
+  retryCount Int     @default(0)
+
+  sessionId String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+/// Product analytics for the Copilot funnel.
+model CopilotEvent {
+  id     String  @id @default(cuid())
+  userId String?
+
+  type      String // SESSION_STARTED | QUESTION_ANSWERED | DRAFT_GENERATED | ...
+  sessionId String?
+  draftId   String?
+  meta      String @default("{}")
+
+  createdAt DateTime @default(now())
+
+  @@index([type, createdAt])
+}
