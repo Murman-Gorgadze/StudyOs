@@ -2,6 +2,7 @@
 // every call just needs `credentials: 'include'` — there is no token to juggle
 // in JavaScript, and nothing sensitive is reachable from the page.
 
+const API_BASE_URL = (import.meta as any).env?.VITE_API_URL || '';
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -16,7 +17,7 @@ export class ApiError extends Error {
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(`/api${path}`, {
+    response = await fetch(`${API_BASE_URL}/api${path}`, {
       credentials: 'include',
       headers: init.body ? { 'Content-Type': 'application/json' } : undefined,
       ...init,
