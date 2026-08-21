@@ -39,11 +39,13 @@ const loginSchema = z.object({
   password: z.string().min(1, 'Please enter your password'),
 });
 
+const isProduction = process.env.NODE_ENV === 'production';
+
 const COOKIE_OPTIONS = {
   httpOnly: true,
-  sameSite: 'lax',
+  sameSite: isProduction ? ('none' as const) : ('lax' as const),
   path: '/',
-  secure: process.env.NODE_ENV === 'production',
+  secure: isProduction,
   maxAge: 30 * 24 * 60 * 60,
 } as const;
 
@@ -126,7 +128,11 @@ export default async function authRoutes(app: FastifyInstance) {
 
   app.post('/auth/logout', async (req, reply) => {
     await destroySession(req.cookies[SESSION_COOKIE]);
-    reply.clearCookie(SESSION_COOKIE, { path: '/' });
+    reply.clearCookie(SESSION_COOKIE, {
+      path: '/',
+      sameSite: isProduction ? 'none' : 'lax',
+      secure: isProduction,
+    });
     return { ok: true };
   });
 
@@ -153,7 +159,7 @@ export default async function authRoutes(app: FastifyInstance) {
     return process.env.NODE_ENV === 'production' ? { ok: true } : { ok: true, devToken: token };
   });
 
-  app.post('/auth/reset-password', async (req, reply) => {
+app.post('/auth/reset-password', async (req, reply) => {
     const { token, password } = z
       .object({ token: z.string().min(1), password: passwordRule })
       .parse(req.body);
@@ -167,7 +173,11 @@ export default async function authRoutes(app: FastifyInstance) {
     });
     // Every existing session is invalidated on a password change.
     await prisma.session.deleteMany({ where: { userId } });
-    reply.clearCookie(SESSION_COOKIE, { path: '/' });
+    reply.clearCookie(SESSION_COOKIE, {
+      path: '/',
+      sameSite: isProduction ? 'none' : 'lax',
+      secure: isProduction,
+    });
     return { ok: true };
   });
 }
