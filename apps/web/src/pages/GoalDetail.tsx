@@ -577,8 +577,29 @@ function InviteModal({
 }) {
   const { push } = useToast();
   const [selected, setSelected] = useState<string[]>([]);
+  const [manual, setManual] = useState('');
   const [busy, setBusy] = useState(false);
   const { data, loading } = useAsync(() => api.get<{ friends: Friend[] }>('/friends'), [open]);
+
+  async function lookupIdentifier() {
+    const value = manual.trim();
+    if (!value) return;
+    try {
+      const result = await api.post<{ users: Array<{ id: string; name: string; email: string }> }>('/users/lookup', {
+        identifier: value,
+      });
+      if (!result.users.length) {
+        push('No user matched that identifier', 'error');
+        return;
+      }
+      const next = result.users.filter((user) => !selected.includes(user.id));
+      setSelected((prev) => [...prev, ...next.map((user) => user.id)]);
+      setManual('');
+      push(next.length === 1 ? 'User added to invite list' : `${next.length} users added to invite list`);
+    } catch (err) {
+      push(err instanceof ApiError ? err.message : 'Could not look up that user', 'error');
+    }
+  }
 
   async function invite() {
     setBusy(true);
@@ -621,6 +642,23 @@ function InviteModal({
         </>
       }
     >
+      <div className="mb-4">
+        <label style={{ fontSize: '0.8rem', fontWeight: 700, color: '#4b4870', display: 'block', marginBottom: 6, fontFamily: 'Plus Jakarta Sans' }}>
+          Invite by email or user ID
+        </label>
+        <div className="flex gap-2">
+          <input
+            value={manual}
+            onChange={(e) => setManual(e.target.value)}
+            placeholder="name, gmail, or user ID"
+            className="flex-1 px-3 py-2.5 text-sm"
+          />
+          <button className="btn-secondary px-3 py-2.5 text-sm" onClick={lookupIdentifier}>
+            Add
+          </button>
+        </div>
+      </div>
+
       {loading ? (
         <Skeleton height={120} />
       ) : data && data.friends.length > 0 ? (

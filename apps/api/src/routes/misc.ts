@@ -6,6 +6,7 @@ import { prisma } from '../lib/prisma.js';
 import { levelProgress } from '../services/engagement.js';
 import { loadGoalForUser, participantSummary } from '../services/goals.js';
 import { goalToday } from '../services/occurrences.js';
+import { userIdentifierEntries } from '../services/user-identifiers.js';
 import { publicUser } from './auth.js';
 
 export default async function miscRoutes(app: FastifyInstance) {
@@ -108,6 +109,7 @@ export default async function miscRoutes(app: FastifyInstance) {
     const body = z
       .object({
         name: z.string().trim().min(2).max(60).optional(),
+        handle: z.string().trim().min(2).max(30).optional(),
         avatarEmoji: z.string().trim().min(1).max(8).optional(),
         bio: z.string().trim().max(300).optional(),
         timezone: z.string().optional(),
@@ -123,7 +125,15 @@ export default async function miscRoutes(app: FastifyInstance) {
       .parse(req.body);
 
     const userId = req.user!.id;
-    if (body.name) await prisma.user.update({ where: { id: userId }, data: { name: body.name } });
+    const userUpdate: { name?: string; handle?: string | null } = {};
+    if (body.name) userUpdate.name = body.name;
+    if (body.handle !== undefined) {
+      const newHandle = body.handle.trim();
+      userUpdate.handle = newHandle ? newHandle.replace(/^@+/, '') : null;
+    }
+    if (Object.keys(userUpdate).length > 0) {
+      await prisma.user.update({ where: { id: userId }, data: userUpdate });
+    }
 
     await prisma.profile.update({
       where: { userId },
@@ -137,6 +147,21 @@ export default async function miscRoutes(app: FastifyInstance) {
         notifyAchievements: body.notifications?.achievements,
       },
     });
+
+    const user = await prisma.user.findUnique({ where: { id: userId }, include: { profile: true } });
+    if (user) {
+      const identifierValues = userIdentifierEntries({
+        email: user.email,
+        handle: user.handle,
+        name: user.name,
+      });
+      await prisma.userIdentifier.deleteMany({ where: { userId } });
+      if (identifierValues.length) {
+        await prisma.userIdentifier.createMany({
+          data: identifierValues.map(({ kind, value }) => ({ userId, kind, value })),
+        });
+      }
+    }
 
     return { user: await publicUser(userId) };
   });

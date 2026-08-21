@@ -104,8 +104,8 @@ export default function Friends() {
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search by name or email"
-          aria-label="Search for people"
+          placeholder="Search by name, email, or user ID"
+          aria-label="Search for people by name, email, or user ID"
           className="w-full pl-11 pr-4 py-3 text-sm"
         />
       </form>
@@ -119,7 +119,7 @@ export default function Friends() {
           </h2>
           {results.length === 0 ? (
             <p style={{ fontSize: '0.85rem', color: '#8b88b0' }}>
-              Nobody matched that. Try their exact email address.
+              Nobody matched that. Try their exact email, username, or user ID.
             </p>
           ) : (
             <div className="flex flex-col gap-2">
@@ -301,7 +301,7 @@ export default function Friends() {
           <EmptyState
             emoji="👋"
             title="Productivity is better together."
-            body="Invite friends and start improving together. Search for someone by name or email above."
+            body="Invite friends and start improving together. Search by name, email, or user ID above."
           />
         )}
       </section>

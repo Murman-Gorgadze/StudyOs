@@ -13,6 +13,7 @@ import {
 import { badRequest, conflict, unauthorized } from '../lib/errors.js';
 import { prisma } from '../lib/prisma.js';
 import { levelProgress } from '../services/engagement.js';
+import { userIdentifierEntries } from '../services/user-identifiers.js';
 
 const passwordRule = z
   .string()
@@ -105,6 +106,13 @@ export default async function authRoutes(app: FastifyInstance) {
         name: body.name,
         passwordHash: await hashPassword(body.password),
         profile: { create: { timezone } },
+        identifiers: {
+          create: userIdentifierEntries({
+            email: body.email,
+            handle: body.name,
+            name: body.name,
+          }),
+        },
       },
     });
 

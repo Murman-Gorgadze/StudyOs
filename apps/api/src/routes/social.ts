@@ -5,6 +5,7 @@ import { badRequest, conflict, forbidden, notFound } from '../lib/errors.js';
 import { prisma } from '../lib/prisma.js';
 import { notify } from '../services/engagement.js';
 import { ensureOccurrences, goalToday } from '../services/occurrences.js';
+import { normalizeIdentifierValue } from '../services/user-identifiers.js';
 
 /** Friendships are stored one row per pair with userAId < userBId, which makes a
  *  duplicate friendship impossible at the database level. */
@@ -72,11 +73,27 @@ export default async function socialRoutes(app: FastifyInstance) {
   app.get('/friends/search', { preHandler: app.requireAuth }, async (req) => {
     const { q } = z.object({ q: z.string().trim().min(1).max(60) }).parse(req.query ?? {});
     const userId = req.user!.id;
+    const query = normalizeIdentifierValue(q);
+
+    const candidateIds = await prisma.userIdentifier.findMany({
+      where: {
+        value: {
+          contains: query,
+          mode: 'insensitive',
+        },
+      },
+      select: { userId: true },
+      take: 200,
+    });
 
     const users = await prisma.user.findMany({
       where: {
         id: { not: userId },
-        OR: [{ name: { contains: q } }, { email: { equals: q.toLowerCase() } }],
+        OR: [
+          { id: { in: candidateIds.map((row) => row.userId) } },
+          { name: { contains: q, mode: 'insensitive' } },
+          { email: { contains: q, mode: 'insensitive' } },
+        ],
       },
       include: { profile: true },
       take: 20,
@@ -139,8 +156,28 @@ export default async function socialRoutes(app: FastifyInstance) {
   });
 
   app.post('/friend-requests', { preHandler: app.requireAuth }, async (req) => {
-    const { userId: targetId } = z.object({ userId: z.string() }).parse(req.body);
+    const payload = z
+      .object({
+        userId: z.string().optional(),
+        identifier: z.string().trim().min(1).max(100).optional(),
+      })
+      .refine((v) => Boolean(v.userId || v.identifier), {
+        message: 'Provide a user id or contact identifier',
+      })
+      .parse(req.body);
     const userId = req.user!.id;
+
+    let targetId = payload.userId ?? null;
+    if (!targetId && payload.identifier) {
+      const normalized = normalizeIdentifierValue(payload.identifier);
+      const match = await prisma.userIdentifier.findFirst({
+        where: { value: { contains: normalized || payload.identifier.trim().toLowerCase(), mode: 'insensitive' } },
+        include: { user: true },
+      });
+      targetId = match?.userId ?? null;
+    }
+
+    if (!targetId) throw notFound('No user matched that identifier');
     if (targetId === userId) throw badRequest('You cannot add yourself', 'SELF_REQUEST');
 
     const target = await prisma.user.findUnique({ where: { id: targetId } });
@@ -168,6 +205,35 @@ export default async function socialRoutes(app: FastifyInstance) {
     });
     await notify(targetId, 'FRIEND', `${req.user!.name} sent you a friend request`);
     return { ok: true, state: 'REQUEST_SENT' as FriendState };
+  });
+
+  app.post('/users/lookup', { preHandler: app.requireAuth }, async (req) => {
+    const { identifier } = z
+      .object({ identifier: z.string().trim().min(1).max(100) })
+      .parse(req.body);
+
+    const query = normalizeIdentifierValue(identifier);
+    const matched = await prisma.userIdentifier.findMany({
+      where: {
+        value: { contains: query || identifier.trim().toLowerCase(), mode: 'insensitive' },
+      },
+      include: { user: { include: { profile: true } } },
+      take: 10,
+    });
+
+    const unique = new Map<string, typeof matched[number]['user']>();
+    for (const row of matched) {
+      if (row.userId !== req.user!.id) unique.set(row.userId, row.user);
+    }
+
+    return {
+      users: [...unique.values()].map((user) => ({
+        id: user.id,
+        name: user.name,
+        avatarEmoji: user.profile?.avatarEmoji ?? '🐱',
+        email: user.email,
+      })),
+    };
   });
 
   app.post('/friend-requests/:id/accept', { preHandler: app.requireAuth }, async (req) => {

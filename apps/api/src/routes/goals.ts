@@ -445,25 +445,50 @@ export default async function goalRoutes(app: FastifyInstance) {
 
   app.post('/goals/:id/invite', { preHandler: app.requireAuth }, async (req) => {
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    const { userIds } = z.object({ userIds: z.array(z.string()).min(1).max(20) }).parse(req.body);
+    const body = z
+      .object({
+        userIds: z.array(z.string()).max(20).optional(),
+        identifiers: z.array(z.string().trim().min(1).max(100)).max(20).optional(),
+      })
+      .refine((v) => Boolean(v.userIds?.length || v.identifiers?.length), {
+        message: 'Choose at least one friend or identifier to invite',
+      })
+      .parse(req.body);
     const inviterId = req.user!.id;
 
     const { goal } = await loadGoalForUser(id, inviterId, 'participate');
+    const userIds = new Set<string>();
 
-    // You may only invite people you are actually friends with.
+    if (body.userIds?.length) {
+      for (const uid of body.userIds) userIds.add(uid);
+    }
+
+    if (body.identifiers?.length) {
+      for (const identifier of body.identifiers) {
+        const query = identifier.trim();
+        const match = await prisma.userIdentifier.findFirst({
+          where: { value: { contains: query.toLowerCase(), mode: 'insensitive' } },
+          select: { userId: true },
+        });
+        if (match) userIds.add(match.userId);
+      }
+    }
+
+    if (userIds.size === 0) throw notFound('No matching users found');
+
     const friendships = await prisma.friendship.findMany({
       where: {
         status: 'ACCEPTED',
         OR: [
-          { userAId: inviterId, userBId: { in: userIds } },
-          { userBId: inviterId, userAId: { in: userIds } },
+          { userAId: inviterId, userBId: { in: [...userIds] } },
+          { userBId: inviterId, userAId: { in: [...userIds] } },
         ],
       },
     });
     const friendIds = new Set(
       friendships.map((f) => (f.userAId === inviterId ? f.userBId : f.userAId)),
     );
-    const invitable = userIds.filter((uid) => friendIds.has(uid));
+    const invitable = [...userIds].filter((uid) => friendIds.has(uid));
     if (invitable.length === 0) throw forbidden('You can only invite your friends');
 
     const created: string[] = [];
