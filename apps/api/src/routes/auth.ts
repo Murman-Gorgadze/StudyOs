@@ -41,12 +41,14 @@ const loginSchema = z.object({
 });
 
 const isProduction = process.env.NODE_ENV === 'production';
+const cookieSameSite = (process.env.COOKIE_SAME_SITE ?? (isProduction ? 'none' : 'lax')) as 'lax' | 'none';
+const cookieSecure = process.env.COOKIE_SECURE !== 'false' && (cookieSameSite === 'none' || isProduction);
 
 const COOKIE_OPTIONS = {
   httpOnly: true,
-  sameSite: isProduction ? ('none' as const) : ('lax' as const),
+  sameSite: cookieSameSite,
   path: '/',
-  secure: isProduction,
+  secure: cookieSecure,
   maxAge: 30 * 24 * 60 * 60,
 } as const;
 
@@ -138,8 +140,8 @@ export default async function authRoutes(app: FastifyInstance) {
     await destroySession(req.cookies[SESSION_COOKIE]);
     reply.clearCookie(SESSION_COOKIE, {
       path: '/',
-      sameSite: isProduction ? 'none' : 'lax',
-      secure: isProduction,
+      sameSite: cookieSameSite,
+      secure: cookieSecure,
     });
     return { ok: true };
   });
@@ -167,7 +169,7 @@ export default async function authRoutes(app: FastifyInstance) {
     return process.env.NODE_ENV === 'production' ? { ok: true } : { ok: true, devToken: token };
   });
 
-app.post('/auth/reset-password', async (req, reply) => {
+  app.post('/auth/reset-password', async (req, reply) => {
     const { token, password } = z
       .object({ token: z.string().min(1), password: passwordRule })
       .parse(req.body);
@@ -183,8 +185,8 @@ app.post('/auth/reset-password', async (req, reply) => {
     await prisma.session.deleteMany({ where: { userId } });
     reply.clearCookie(SESSION_COOKIE, {
       path: '/',
-      sameSite: isProduction ? 'none' : 'lax',
-      secure: isProduction,
+      sameSite: cookieSameSite,
+      secure: cookieSecure,
     });
     return { ok: true };
   });
